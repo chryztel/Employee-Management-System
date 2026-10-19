@@ -16,7 +16,7 @@ const good = 'WorkSync-Test-2026!';
 
 function fixture(status = 'invited', role = 'employee') {
   const profile = { id: randomUUID(), auth_user_id: randomUUID(), employee_id: role === 'manager' ? 'MGR-001' : 'EMP-001', email: 'offline@example.invalid', role, status, username: status === 'active' ? 'test.user' : null, display_name: 'Test User' };
-  const f = { profiles: [profile], tokens: new Map(), jar: new Map(), sessions: new Set(), queued: [], mails: [], passwords: new Map([[profile.email, good]]), counts: new Map(), writes: 0, session: null, profile };
+  const f = { profiles: [profile], tokens: new Map(), jar: new Map(), sessions: new Set(), queued: [], mails: [], passwords: new Map([[profile.email, good]]), counts: new Map(), writes: 0, session: null, profile, appMetadata: { role } };
   const jar = { get: n => f.jar.has(n) ? { value: f.jar.get(n) } : undefined, getAll: () => [...f.jar].map(([name, value]) => ({ name, value })), set: (n, v) => f.jar.set(n, v), delete: n => f.jar.delete(n) };
   const ok = data => Promise.resolve({ data, error: null });
   class Query {
@@ -39,7 +39,7 @@ function fixture(status = 'invited', role = 'employee') {
         if (main) f.session = ownSession;
         return { data: { user: ownSession.user, session: { access_token: 'fake' } }, error: null };
       },
-      async getUser() { const s = main ? f.session : ownSession; return { data: { user: s?.user || null }, error: s ? null : { status: 401 } }; },
+      async getUser() { const s = main ? f.session : ownSession; return { data: { user: s ? { ...s.user, app_metadata: { ...f.appMetadata } } : null }, error: s ? null : { status: 401 } }; },
       async getClaims() { const s = main ? f.session : ownSession; return { data: { claims: { session_id: s?.id } }, error: s ? null : { status: 401 } }; },
       async signOut({ scope } = {}) {
         if (scope === 'global' && f.failSignOut) { f.failSignOut = false; return { error: { status: 500 } }; }
@@ -62,10 +62,12 @@ function fixture(status = 'invited', role = 'employee') {
     } };
   }
   const admin = { from: table => new Query(table), auth: { admin: {
-    async updateUserById(id, { password }) {
+    async getUserById(id) { return { data: { user: { id, app_metadata: { ...f.appMetadata } } }, error: null }; },
+    async updateUserById(id, { password, app_metadata }) {
+      if (password === undefined) { Object.assign(f.appMetadata, app_metadata); return { error: null }; }
       f.writes++;
       if (f.rejectPassword) return { error: { status: 422 } };
-      const p = f.profiles.find(p => p.auth_user_id === id); f.passwords.set(p.email, password);
+      const p = f.profiles.find(p => p.auth_user_id === id); f.passwords.set(p.email, password); Object.assign(f.appMetadata, app_metadata);
       if (f.unknownWrite) { f.unknownWrite = false; return { error: { status: 500 } }; }
       return { error: null };
     },
@@ -128,8 +130,9 @@ function fixture(status = 'invited', role = 'employee') {
 }
 async function issued(f) {
   const response = await f.post('request-activation', { employeeId: f.profile.employee_id, email: f.profile.email }); assert.equal(response.status, 200); await f.flush();
-  const token = new URL(f.mails.at(-1).url).searchParams.get('token'); f.jar.set('worksync-activation', token); return token;
+  return f.mails.at(-1);
 }
+async function quietly(fn) { const oldError = console.error; console.error = () => {}; try { return await fn(); } finally { console.error = oldError; } }
 function credentials(username = 'new.user') { return { username, password: good, confirmPassword: good }; }
 
 test('token entropy, hashing, password rules, username normalization, and proof tamper/expiry checks', () => {
@@ -144,45 +147,59 @@ test('real POST route rejects cross-site requests, invalid JSON, oversized bodie
   const f = fixture(); assert.equal((await f.post('login', {}, { headers: { origin: 'https://attacker.invalid' } })).status, 403);
   assert.equal((await f.post('login', {}, { raw: 'not-json' })).status, 400); assert.equal((await f.post('login', {}, { raw: 'x'.repeat(9000) })).status, 413);
   assert.equal((await f.post('signup')).status, 404); assert.equal((await f.post('__proto__')).status, 404);
-  assert.equal((await f.post('complete-activation', { username: 'user', password: 'short', confirmPassword: 'short' })).status, 400);
+  assert.equal((await f.post('complete-activation', { username: 'user', password: 'short', confirmPassword: 'short' })).status, 404);
+  assert.equal((await f.post('reset-password', { password: 'short', confirmPassword: 'short' })).status, 400);
   assert.equal(f.writes, 0); assert.equal(f.mails.length, 0);
 });
-test('unknown and eligible activation requests have identical responses and only hashed tokens are stored', async () => {
+test('unknown and eligible activation requests have identical responses; email carries temporary credentials', async () => {
   const f = fixture(); const eligible = await f.post('request-activation', { email: f.profile.email, employeeId: f.profile.employee_id });
   const unknown = await f.post('request-activation', { email: 'unknown@example.invalid', employeeId: 'EMP-999' });
-  assert.equal(eligible.status, unknown.status); assert.deepEqual(await eligible.json(), await unknown.json()); assert.equal(f.mails.length, 0);
-  await f.flush(); assert.equal(f.mails.length, 1); const raw = new URL(f.mails[0].url).searchParams.get('token');
-  assert.ok(!JSON.stringify([...f.tokens.values()]).includes(raw)); assert.equal(f.tokens.size, 1);
+  assert.equal(eligible.status, unknown.status); assert.deepEqual(await eligible.json(), await unknown.json()); assert.equal(f.mails.length, 0); assert.equal(f.profile.status, 'invited');
+  await f.flush(); assert.equal(f.mails.length, 1); const mail = f.mails[0];
+  assert.equal(mail.url, 'http://localhost:3000/login'); assert.equal(mail.username, 'emp-001'); assert.ok(f.load('lib/auth/policy.ts').validPassword(mail.password));
+  assert.equal(f.passwords.get(f.profile.email), mail.password); assert.equal(f.profile.status, 'active'); assert.equal(f.profile.username, 'emp-001');
+  assert.equal(f.appMetadata.must_change_credentials, true); assert.equal(f.appMetadata.role, 'employee'); assert.equal(f.writes, 1);
+  assert.ok(!JSON.stringify([...f.tokens.values()]).includes(mail.password)); assert.equal([...f.tokens.values()][0].delivery_status, 'sent');
+  const again = fixture(); again.profile.employee_id = 'EMP-002'; await issued(again); assert.notEqual(again.mails[0].password, mail.password);
 });
-test('active accounts cannot request activation; send failures preserve retry eligibility', async () => {
-  const active = fixture('active'); await active.post('request-activation', { email: active.profile.email, employeeId: active.profile.employee_id }); await active.flush(); assert.equal(active.tokens.size, 0);
-  const f = fixture(); f.failMail = true; const oldError = console.error; console.error = () => {};
-  try { await f.post('request-activation', { email: f.profile.email, employeeId: f.profile.employee_id }); await f.flush(); } finally { console.error = oldError; }
-  assert.equal([...f.tokens.values()][0].delivery_status, 'failed'); f.failMail = false; await issued(f); assert.equal(f.mails.length, 1); assert.equal([...f.tokens.values()].filter(t => !t.revoked_at).length, 1);
+test('active accounts cannot request activation; send failures are recorded', async () => {
+  const active = fixture('active'); await active.post('request-activation', { email: active.profile.email, employeeId: active.profile.employee_id }); await active.flush(); assert.equal(active.tokens.size, 0); assert.equal(active.writes, 0);
+  const f = fixture(); f.failMail = true; await quietly(() => issued(f));
+  assert.equal([...f.tokens.values()][0].delivery_status, 'failed'); assert.equal(f.mails.length, 0);
 });
-test('activation is single-use; expired and rotated tokens cannot mutate credentials', async () => {
-  const f = fixture(); await issued(f); const result = await f.post('complete-activation', credentials()); assert.equal(result.status, 200); assert.equal(f.profile.status, 'active'); assert.equal(f.writes, 1);
-  assert.equal((await f.post('complete-activation', credentials())).status, 410); assert.equal(f.writes, 1);
-  const expired = fixture(); await issued(expired); [...expired.tokens.values()][0].expires_at = Date.now() - 1; assert.equal((await expired.post('complete-activation', credentials())).status, 410); assert.equal(expired.writes, 0);
-  const rotated = fixture(); const old = await issued(rotated); await issued(rotated); rotated.jar.set('worksync-activation', old); assert.equal((await rotated.post('complete-activation', credentials())).status, 410);
+test('a repeated request rotates unreplaced temporary credentials, but never after the user chose their own', async () => {
+  const f = fixture(); const first = await issued(f); const second = await issued(f);
+  assert.equal(f.mails.length, 2); assert.equal(second.username, first.username); assert.notEqual(second.password, first.password);
+  assert.equal(f.passwords.get(f.profile.email), second.password); assert.equal(f.writes, 2);
+  assert.equal((await f.post('login', { username: first.username, password: first.password })).status, 401);
+  assert.equal((await f.post('login', { username: second.username, password: second.password })).status, 200);
+  assert.equal((await f.post('credentials', credentials('john.doe'))).status, 200);
+  await issued(f); assert.equal(f.mails.length, 2); assert.equal(f.passwords.get(f.profile.email), good);
 });
-test('concurrent activation claims perform only one password write', async () => {
-  const f = fixture(); await issued(f); const responses = await Promise.all([f.post('complete-activation', credentials()), f.post('complete-activation', credentials())]);
-  assert.ok(responses.some(r => r.status === 200)); assert.equal(f.writes, 1); assert.equal(f.profile.status, 'active');
+test('first login with temporary credentials is forced to replace them before any portal', async () => {
+  const f = fixture(); const mail = await issued(f); const guards = f.load('lib/auth/session.ts');
+  assert.deepEqual(await (await f.post('login', { username: mail.username, password: mail.password })).json(), { redirect: '/update-credentials' });
+  await assert.rejects(guards.requireRole('employee'), e => e.destination === '/update-credentials');
+  const reuse = { username: 'john.doe', password: mail.password, confirmPassword: mail.password };
+  assert.equal((await f.post('credentials', reuse)).status, 400); assert.equal(f.profile.username, 'emp-001');
+  assert.equal((await f.post('credentials', { username: 'john.doe', password: 'short', confirmPassword: 'short' })).status, 400);
+  const result = await f.post('credentials', credentials('john.doe')); assert.equal(result.status, 200); assert.deepEqual(await result.json(), { redirect: '/credentials-updated?mode=activation' });
+  assert.equal(f.profile.username, 'john.doe'); assert.equal(f.passwords.get(f.profile.email), good); assert.equal(f.appMetadata.must_change_credentials, false); assert.equal(f.session, null);
+  assert.equal((await f.post('login', { username: mail.username, password: mail.password })).status, 401);
+  assert.deepEqual(await (await f.post('login', { username: 'john.doe', password: good })).json(), { redirect: '/employee' }); assert.equal((await guards.requireRole('employee')).username, 'john.doe');
 });
-test('uncertain Auth result and failed DB completion reconcile without another password write', async () => {
-  for (const failure of ['unknownWrite', 'failFinish']) {
-    const f = fixture(); await issued(f); f[failure] = true; assert.equal((await f.post('complete-activation', credentials())).status, 503);
-    assert.equal(f.profile.status, 'invited'); assert.equal(f.writes, 1);
-    assert.equal((await f.post('complete-activation', { ...credentials(), password: 'Different-Password-2026!', confirmPassword: 'Different-Password-2026!' })).status, 503); assert.equal(f.writes, 1);
-    assert.equal((await f.post('complete-activation', credentials())).status, 200); assert.equal(f.writes, 1);
-  }
+test('a taken default username falls back to a suffixed one without extra password writes', async () => {
+  const f = fixture(); f.profiles.push({ ...f.profile, id: randomUUID(), auth_user_id: randomUUID(), email: 'other@example.invalid', employee_id: 'EMP-900', username: 'emp-001', status: 'active' });
+  const mail = await issued(f); assert.match(mail.username, /^emp-001-\d{4}$/); assert.equal(f.profile.username, mail.username); assert.equal(f.writes, 1); assert.equal(f.profile.status, 'active');
 });
-test('definitive password rejection releases the claim and username conflicts do not write passwords', async () => {
-  const f = fixture(); await issued(f); f.rejectPassword = true; assert.equal((await f.post('complete-activation', credentials())).status, 400); assert.equal(f.profile.username, null);
-  f.rejectPassword = false; assert.equal((await f.post('complete-activation', credentials())).status, 200);
-  const conflict = fixture(); await issued(conflict); conflict.profiles.push({ ...conflict.profile, id: randomUUID(), username: 'new.user', status: 'active' });
-  assert.equal((await conflict.post('complete-activation', credentials())).status, 409); assert.equal(conflict.writes, 0);
+test('rejected or uncertain password writes leave the account invited and send no credentials', async () => {
+  const rejected = fixture(); rejected.rejectPassword = true; await quietly(() => issued(rejected));
+  assert.equal(rejected.profile.status, 'invited'); assert.equal(rejected.profile.username, null); assert.equal(rejected.mails.length, 0);
+  rejected.rejectPassword = false; const mail = await issued(rejected); assert.equal(rejected.profile.status, 'active'); assert.equal(mail.username, 'emp-001');
+  const uncertain = fixture(); uncertain.unknownWrite = true; await quietly(() => issued(uncertain));
+  assert.equal(uncertain.profile.status, 'invited'); assert.equal(uncertain.mails.length, 0);
+  // An unresolved Auth write blocks reissue so a second password cannot overwrite it.
+  await issued(uncertain); assert.equal(uncertain.writes, 1); assert.equal(uncertain.mails.length, 0);
 });
 test('login resolves names server-side, hides account existence, rate limits, and uses verified database roles', async () => {
   const f = fixture('active'); const wrong = await f.post('login', { username: 'test.user', password: 'wrong' }); const unknown = await f.post('login', { username: 'unknown.user', password: 'wrong' });

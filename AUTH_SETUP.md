@@ -43,7 +43,7 @@ The migration is additive. Rollback means deploying a maintenance/login shell wh
 
 - Enable Email/password sign-in; disable **Allow new users to sign up** and anonymous sign-ins. No public registration is implemented, but the project-level Auth API must also reject signup. [General configuration](https://supabase.com/docs/guides/auth/general-configuration).
 - Keep email confirmation enabled. Successful token-based activation explicitly confirms the pre-created account through the server Admin API.
-- Set Site URL to the exact `NEXT_PUBLIC_APP_URL`. Add your HTTPS production origin and local development origin to allowed redirect URLs; include `/auth/recovery` and `/auth/activate` paths where needed. Links generated here use a fixed server-configured origin, not a user-supplied redirect.
+- Set Site URL to the exact `NEXT_PUBLIC_APP_URL`. Add your HTTPS production origin and local development origin to allowed redirect URLs; include the `/auth/recovery` path where needed. Links generated here use a fixed server-configured origin, not a user-supplied redirect.
 - Set Email OTP Expiration to **1800 seconds** for password recovery. Supabase controls recovery OTP expiry; the application separately enforces a 30-minute activation expiry and a 15-minute recovery retry proof. [Email OTP/link expiry](https://supabase.com/docs/guides/auth/auth-email-passwordless).
 - Set a password minimum of 12 characters and require lowercase, uppercase, digits, and symbols. Leaked-password protection can be enabled if supported by your plan. The app validates the same rules before password writes. [Password security](https://supabase.com/docs/guides/auth/password-security).
 - This implementation reauthenticates the current password before normal credential updates. It does not implement Supabase's separate nonce/OTP reauthentication UI: keep **Secure password change** disabled unless that additional flow is added. Recovery uses the verified recovery session.
@@ -64,13 +64,15 @@ One template supports both activation and recovery. Configure the recipient as `
 | `app_name` | WorkSync |
 | `email_subject` | Activate your WorkSync account / Reset your WorkSync password |
 | `message` | Action-specific instructions |
-| `action_label` | Activate account / Reset password |
-| `action_url` | Full single-use activation or recovery URL |
-| `activation_link` | Activation URL for activation mail; empty for recovery |
+| `action_label` | Log in to WorkSync / Reset password |
+| `action_url` | Login URL for activation mail; single-use recovery URL |
+| `login_url` | Login URL for activation mail; empty for recovery |
+| `username` | Temporary username (activation only) |
+| `temp_password` | Temporary password (activation only) |
 | `reset_link` | Recovery URL for recovery mail; empty for activation |
-| `expires_at` | Activation expiry timestamp / Supabase recovery expiry instructions |
+| `expires_at` | Empty for activation / Supabase recovery expiry instructions |
 
-Do not place a username/password or any API key in the template. Token URLs are private bearer links. Disable link tracking, keep the application's no-referrer policy, and redact query strings from hosting/access logs.
+Activation mail contains temporary credentials by design. Activation sets the Auth `app_metadata.must_change_credentials` flag; while it is set, login and every portal redirect to `/update-credentials`, which requires a new username and a password different from the temporary one, then clears the flag. Show `{{username}}` and `{{temp_password}}` only in the activation template branch. Never put API keys in the template. Recovery URLs are private bearer links. Disable link tracking, keep the application's no-referrer policy, and redact query strings from hosting/access logs.
 
 Email delivery runs through Next.js `after()` following a generic response to avoid revealing eligibility through provider latency. Hosts must support Next.js after-response work and the handler's configured 60-second maximum duration. Activation rows record pending/sent/failed provider submission status; “sent” is API acceptance, not proof of inbox delivery. An uncertain send keeps the token valid; requesting another link rotates unclaimed older tokens. No raw activation token is stored in the database. If the process dies before sending, request another link.
 
@@ -80,17 +82,15 @@ Email delivery runs through Next.js `after()` following a generic response to av
 | --- | --- |
 | `/` | Redirect to login |
 | `/login` | Username/password login; existing sessions redirect to their role |
-| `/activate` | Registered email/employee ID activation request |
-| `/auth/activate?token=…` | Validate link server-side, stage HttpOnly token, remove token from URL |
-| `/activation-confirmed` | Email verified; credentials still required |
-| `/update-credentials` | Initial credentials with activation grant, or authenticated account settings |
+| `/activate` | Registered email/employee ID activation request; emails temporary credentials |
+| `/update-credentials` | Forced first-login credentials (temporary ones), or authenticated account settings |
 | `/credentials-updated` | Completion confirmation and redirect to login |
 | `/forgot-password` | Generic recovery email request |
 | `/auth/recovery?token_hash=…` | Stage recovery token; GET does not consume OTP |
 | `/reset-password` | Verify recovery OTP and set password on POST |
 | `/employee`, `/manager` | Server-verified role-restricted portals |
 
-POST JSON endpoints under `/api/auth/`: `login`, `logout`, `request-activation`, `complete-activation`, `forgot-password`, `reset-password`, and `credentials`. Unsupported actions, including signup, return 404. Requests require the configured Origin, JSON body, and an 8 KB size cap. Activation tokens and recovery proofs are HttpOnly; login/session persistence uses HttpOnly Supabase cookies with SameSite=Lax and Secure on HTTPS. `proxy.ts` refreshes cookies; page/API guards verify the Supabase user, current Auth session, and database profile role/status.
+POST JSON endpoints under `/api/auth/`: `login`, `logout`, `request-activation`, `forgot-password`, `reset-password`, and `credentials`. Unsupported actions, including signup, return 404. Requests require the configured Origin, JSON body, and an 8 KB size cap. Recovery proofs are HttpOnly; login/session persistence uses HttpOnly Supabase cookies with SameSite=Lax and Secure on HTTPS. `proxy.ts` refreshes cookies; page/API guards verify the Supabase user, current Auth session, and database profile role/status.
 
 Normal credential changes require the current password, then sign out all sessions. Profile email is administrator-managed. Other contact fields remain local demo data. Business-module edits do not write to Supabase.
 
@@ -111,13 +111,13 @@ npm.cmd run auth:smoke
 After live migration/provisioning and approval to send email:
 
 1. Open `/activate`. Use **MGR-001** and **chryztelsalvador@gmail.com**; submit once and check inbox/spam. The response deliberately does not reveal whether the account is eligible.
-2. Open the email link. Continue to create a unique manager username and a strong password. Confirm activation, then log in. Expect `/manager`.
+2. Log in with the temporary username and password from the email. Expect `/update-credentials`; portals redirect there until you choose a unique username and a new strong password. Log in again with them. Expect `/manager`.
 3. In that manager session, visit `/employee`. Expect a server-side redirect to `/manager`.
 4. Log out. Expect `/login`; direct access to either portal is denied.
 5. Repeat for **EMP-001** and **dump3319@gmail.com**, choosing a different username. Expect `/employee`; visiting `/manager` redirects back to `/employee`.
 6. Refresh and restart the browser within the session lifetime to check persistence. Use Profile settings or `/update-credentials` to change credentials with the current password; log in again with the new credentials.
 7. Use `/forgot-password` with the registered email. Follow the recovery email, choose a new password, and sign in again. Verify the old password fails and replaying the recovery link cannot reset again.
-8. Replay an activation link after success: it must be rejected. Use a dedicated test account/database to check real expiration or inspect a token after 30 minutes; do not shorten live tokens or reset active accounts just to test.
+8. Log in with the old temporary password after replacing it: it must be rejected. A second activation request for an active account sends nothing; a lost activation email is recovered through `/forgot-password`.
 
 Existing confirmed accounts associated as active skip activation and use the employee-ID username plus their existing password. If that password is unknown, use the approved recovery process rather than provisioning a replacement password.
 

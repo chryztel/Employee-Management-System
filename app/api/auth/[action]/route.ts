@@ -1,9 +1,9 @@
 import { checkOrigin, readBody, json, AuthHttpError } from '@/lib/auth/http';
-import { login, logout, requestActivation, activate, forgotPassword, resetPassword, updateCredentials } from '@/lib/auth/handlers';
+import { login, logout, requestActivation, forgotPassword, resetPassword, updateCredentials } from '@/lib/auth/handlers';
 export const maxDuration = 60;
 
 const handlers: Record<string, (body: Record<string, unknown>) => Promise<object>> = {
-  login, logout, 'request-activation': requestActivation, 'complete-activation': activate,
+  login, logout, 'request-activation': requestActivation,
   'forgot-password': forgotPassword, 'reset-password': resetPassword, credentials: updateCredentials,
 };
 export async function POST(request: Request, context: { params: Promise<{ action: string }> }) {

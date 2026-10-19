@@ -23,4 +23,4 @@ export async function proxy(request: NextRequest) {
   await client.auth.getClaims();
   return response;
 }
-export const config = { matcher: ['/employee/:path*', '/manager/:path*', '/login', '/activate', '/activation-confirmed', '/credentials-updated', '/forgot-password', '/update-credentials', '/reset-password', '/api/auth/:path*'] };
+export const config = { matcher: ['/employee/:path*', '/manager/:path*', '/login', '/activate', '/credentials-updated', '/forgot-password', '/update-credentials', '/reset-password', '/api/auth/:path*'] };

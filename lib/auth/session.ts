@@ -3,7 +3,7 @@ import { redirect } from 'next/navigation';
 import { connection } from 'next/server';
 import { serverClient } from '../supabase/server';
 import { adminClient } from '../supabase/admin';
-import { isAuthorized, roleDestination, type AccountProfile, type AccountRole } from './policy';
+import { isAuthorized, roleDestination, MUST_CHANGE_CREDENTIALS, type AccountProfile, type AccountRole } from './policy';
 export async function authenticatedAccount(readOnly = false) {
   await connection(); // Never evaluate an identity in a partial-prerender snapshot.
   const client = await serverClient(readOnly);
@@ -19,11 +19,14 @@ export async function authenticatedAccount(readOnly = false) {
   if (profileError) throw new Error('Account verification unavailable');
   const profile = data as AccountProfile | null;
   if (!profile || !['employee', 'manager'].includes(profile.role)) return null;
-  return { client, user, profile, sessionId };
+  // getUser() reads Auth directly, so a cleared flag applies without a token refresh.
+  const mustChangeCredentials = user.app_metadata?.[MUST_CHANGE_CREDENTIALS] === true;
+  return { client, user, profile, sessionId, mustChangeCredentials };
 }
 export async function requireRole(role: AccountRole) {
   const account = await authenticatedAccount(true);
   if (!account) redirect('/login');
+  if (account.mustChangeCredentials) redirect('/update-credentials');
   if (!isAuthorized(account.profile, role)) redirect(roleDestination(account.profile.role));
   return account.profile;
 }

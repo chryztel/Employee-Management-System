@@ -1,6 +1,10 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 export function newActivationToken() { return randomBytes(32).toString('base64url'); }
 export function validActivationToken(token: string) { return /^[A-Za-z0-9_-]{43}$/.test(token); }
+// Users type this from an email: no look-alike characters (0/O, 1/l/I) or -/_.
+// Fixed prefix/suffix guarantee every password rule; the middle carries ~81 bits.
+const READABLE = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+export function temporaryPassword() { return `Ws#${Array.from({ length: 14 }, () => READABLE[randomInt(READABLE.length)]).join('')}9a`; }
 export function tokenHash(token: string) { return createHash('sha256').update(token).digest('hex'); }
 export function privateHash(value: string, key: string) { return createHmac('sha256', key).update(value).digest('hex'); }
 export type RecoveryProof = { purpose: 'recovery'; userId: string; sessionId: string; expires: number; passwordUpdated?: boolean };

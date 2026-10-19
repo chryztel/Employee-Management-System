@@ -6,7 +6,7 @@ import { authenticatedAccount } from '@/lib/auth/session';
 import { roleDestination } from '@/lib/auth/policy';
 async function LoginContent({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   const account = await authenticatedAccount(true);
-  if (account) redirect(roleDestination(account.profile.role));
+  if (account) redirect(account.mustChangeCredentials ? '/update-credentials' : roleDestination(account.profile.role));
   const params = await searchParams;
   return <AuthFrame><AuthForm mode="login" notice={params.updated ? 'Your credentials are ready. Please sign in.' : ''}/></AuthFrame>;
 }

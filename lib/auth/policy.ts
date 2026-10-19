@@ -13,7 +13,9 @@ export function passwordRules(value: string) {
 export function validPassword(value: string) { return Object.values(passwordRules(value)).every(Boolean); }
 export function roleDestination(role: AccountRole) { return role === 'manager' ? '/manager' : '/employee'; }
 export function isAuthorized(profile: Pick<AccountProfile, 'role' | 'status'> | null, role: AccountRole) { return profile?.status === 'active' && profile.role === role; }
-export const ACTIVATION_COOKIE = 'worksync-activation';
+// Server-controlled Auth app_metadata flag: set when activation emails temporary
+// credentials, cleared once the user chooses their own username and password.
+export const MUST_CHANGE_CREDENTIALS = 'must_change_credentials';
 export const RECOVERY_TOKEN_COOKIE = 'worksync-recovery-token';
 export const RECOVERY_PROOF_COOKIE = 'worksync-recovery-proof';
 export const GENERIC_EMAIL_MESSAGE = 'If the details match an eligible account, an email with the next steps will arrive shortly. Check your inbox and spam folder.';

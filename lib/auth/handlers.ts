@@ -5,10 +5,11 @@ import { adminClient, isolatedAuthClient } from '../supabase/admin';
 import { serverClient } from '../supabase/server';
 import { authenticatedAccount } from './session';
 import { appOrigin, cookieOptions, required } from './config';
-import { newActivationToken, validActivationToken, tokenHash, privateHash, readRecoveryProof, signRecoveryProof } from './crypto';
+import { randomInt } from 'node:crypto';
+import { newActivationToken, temporaryPassword, tokenHash, privateHash, readRecoveryProof, signRecoveryProof } from './crypto';
 import { completeActivation, ActivationFailure, type ActivationOperation } from './activation';
 import { sendAuthEmail } from './email';
-import { ACTIVATION_COOKIE, RECOVERY_TOKEN_COOKIE, RECOVERY_PROOF_COOKIE, GENERIC_EMAIL_MESSAGE, normalizeUsername, validUsername, validPassword, validEmail, roleDestination, type AccountProfile } from './policy';
+import { MUST_CHANGE_CREDENTIALS, RECOVERY_TOKEN_COOKIE, RECOVERY_PROOF_COOKIE, GENERIC_EMAIL_MESSAGE, normalizeUsername, validUsername, validPassword, validEmail, roleDestination, type AccountProfile } from './policy';
 import { AuthHttpError, input, rateLimit } from './http';
 
 async function passwordMatches(email: string, password: string) {
@@ -43,14 +44,14 @@ export async function login(body: Record<string, unknown>) {
   // Re-check the profile and session after sign-in; roles come from the database.
   const account = await authenticatedAccount();
   if (!account) { await client.auth.signOut({ scope: 'local' }); throw new AuthHttpError(401, 'Invalid username or password.'); }
-  return { redirect: roleDestination(account.profile.role) };
+  return { redirect: account.mustChangeCredentials ? '/update-credentials' : roleDestination(account.profile.role) };
 }
 export async function logout() {
   const client = await serverClient();
   const { error } = await client.auth.signOut({ scope: 'local' });
   if (error) throw new AuthHttpError(503, 'Could not finish signing out. Please retry.');
   const jar = await cookies();
-  for (const name of [ACTIVATION_COOKIE, RECOVERY_TOKEN_COOKIE, RECOVERY_PROOF_COOKIE]) jar.delete(name);
+  for (const name of [RECOVERY_TOKEN_COOKIE, RECOVERY_PROOF_COOKIE]) jar.delete(name);
   return { redirect: '/login' };
 }
 export async function requestActivation(body: Record<string, unknown>) {
@@ -61,62 +62,71 @@ export async function requestActivation(body: Record<string, unknown>) {
   const raw = newActivationToken(); const hash = tokenHash(raw); const admin = adminClient();
   const { data, error } = await admin.rpc('auth_issue_activation', { p_employee_id: employeeId, p_email: email, p_hash: hash });
   if (error) throw new AuthHttpError(503, 'Activation is temporarily unavailable. Please try again later.');
-  // Send after the generic response. Delivery latency does not reveal eligibility.
-  // A failed/uncertain send retains a valid token; a later request can rotate it.
+  // Activate and email after the generic response. Latency does not reveal eligibility.
   if (data) after(async () => {
     try {
-      await sendAuthEmail({ to: data.email, name: data.display_name, kind: 'activation', url: `${appOrigin()}/auth/activate?token=${encodeURIComponent(raw)}`, expires: data.expires_at });
+      const credentials = await issueTemporaryCredentials(hash, employeeId.toLowerCase());
+      await sendAuthEmail({ to: data.email, name: data.display_name, kind: 'activation', url: `${appOrigin()}/login`, expires: '', ...credentials });
       await admin.from('activation_tokens').update({ delivery_status: 'sent' }).eq('token_hash', hash);
     } catch {
       await admin.from('activation_tokens').update({ delivery_status: 'failed' }).eq('token_hash', hash);
-      console.error('WorkSync activation email failed or delivery is uncertain.');
+      console.error('WorkSync activation or email delivery failed or is uncertain.');
     }
+  });
+  else after(async () => {
+    try { await resendTemporaryCredentials(employeeId, email); }
+    catch { console.error('WorkSync temporary credential resend failed or is uncertain.'); }
   });
   return { message: GENERIC_EMAIL_MESSAGE };
 }
-export async function activate(body: Record<string, unknown>) {
-  const username = normalizeUsername(input(body, 'username', 64));
-  if (!validUsername(username)) throw new AuthHttpError(400, 'Use 3–32 letters, numbers, dots, underscores, or hyphens for your username.');
-  const password = passwordInput(body); const jar = await cookies(); const raw = jar.get(ACTIVATION_COOKIE)?.value || '';
-  if (!validActivationToken(raw)) throw new AuthHttpError(410, 'This activation link is invalid, expired, or already used. Request a new link.');
-  const hash = tokenHash(raw); await rateLimit('activation-complete', hash, 10);
+// A lost or unreadable activation email must not strand the account: while the
+// temporary credentials are still unreplaced, a new request rotates the password.
+async function resendTemporaryCredentials(employeeId: string, email: string) {
   const admin = adminClient();
-  try {
-    await completeActivation({
-      async begin(value, name) {
-        const { data, error } = await admin.rpc('auth_begin_activation', { p_hash: value, p_username: name });
-        if (error?.code === '23505') throw new AuthHttpError(409, 'This username is unavailable. Please choose another.');
-        if (error) throw new AuthHttpError(503, 'Setup could not start. If you already submitted, retry with the same username and password.');
-        return data as ActivationOperation | null;
-      },
-      async setPassword(userId, value) {
-        try {
-          const { error } = await admin.auth.admin.updateUserById(userId, { password: value, email_confirm: true });
-          if (!error) return 'ok';
-          return error.status && error.status >= 400 && error.status < 500 ? 'rejected' : 'unknown';
-        } catch { return 'unknown'; }
-      },
-      verifyPassword: passwordMatches,
-      async finish(value, operation) {
-        const { data, error } = await admin.rpc('auth_finish_activation', { p_hash: value, p_operation: operation });
-        if (error) throw new ActivationFailure('pending');
-        return data === true;
-      },
-      async cancel(value, operation) { const { error } = await admin.rpc('auth_cancel_activation', { p_hash: value, p_operation: operation }); if (error) throw new ActivationFailure('pending'); },
-    }, hash, username, password);
-  } catch (error) {
-    if (error instanceof ActivationFailure) {
-      if (error.code === 'invalid') throw new AuthHttpError(410, 'This link is invalid, expired, or already used. If setup finished, sign in.');
-      if (error.code === 'password') throw new AuthHttpError(400, 'Supabase could not accept this password. Choose a different strong password and retry.');
-      throw new AuthHttpError(503, 'Setup is pending. Retry with the exact same username and password. If the link expires, contact your administrator.');
-    }
-    throw error;
+  const { data, error } = await admin.from('profiles').select('*').eq('employee_id', employeeId).eq('email', email).eq('status', 'active').maybeSingle();
+  const profile = data as AccountProfile | null;
+  if (error || !profile) return;
+  const { data: auth, error: userError } = await admin.auth.admin.getUserById(profile.auth_user_id);
+  if (userError || auth.user?.app_metadata?.[MUST_CHANGE_CREDENTIALS] !== true) return;
+  const password = temporaryPassword();
+  const { error: writeError } = await admin.auth.admin.updateUserById(profile.auth_user_id, { password });
+  if (writeError) throw new Error('Temporary password rotation failed');
+  await sendAuthEmail({ to: profile.email, name: profile.display_name, kind: 'activation', url: `${appOrigin()}/login`, expires: '', username: profile.username, password });
+}
+class UsernameTaken extends Error {}
+// Activates the invited account with a server-chosen username and random temporary
+// password. The Auth flag forces /update-credentials until the user replaces both.
+async function issueTemporaryCredentials(hash: string, baseUsername: string) {
+  const admin = adminClient(); const password = temporaryPassword();
+  for (const username of [baseUsername, `${baseUsername}-${randomInt(1000, 10000)}`]) {
+    try {
+      await completeActivation({
+        async begin(value, name) {
+          const { data, error } = await admin.rpc('auth_begin_activation', { p_hash: value, p_username: name });
+          if (error?.code === '23505') throw new UsernameTaken();
+          if (error) throw new ActivationFailure('pending');
+          return data as ActivationOperation | null;
+        },
+        async setPassword(userId, value) {
+          try {
+            // Auth merges app_metadata keys, so employee_id/role are preserved.
+            const { error } = await admin.auth.admin.updateUserById(userId, { password: value, email_confirm: true, app_metadata: { [MUST_CHANGE_CREDENTIALS]: true } });
+            if (!error) return 'ok';
+            return error.status && error.status >= 400 && error.status < 500 ? 'rejected' : 'unknown';
+          } catch { return 'unknown'; }
+        },
+        verifyPassword: passwordMatches,
+        async finish(value, operation) {
+          const { data, error } = await admin.rpc('auth_finish_activation', { p_hash: value, p_operation: operation });
+          if (error) throw new ActivationFailure('pending');
+          return data === true;
+        },
+        async cancel(value, operation) { const { error } = await admin.rpc('auth_cancel_activation', { p_hash: value, p_operation: operation }); if (error) throw new ActivationFailure('pending'); },
+      }, hash, username, password);
+      return { username, password };
+    } catch (error) { if (!(error instanceof UsernameTaken)) throw error; }
   }
-  jar.delete(ACTIVATION_COOKIE);
-  // Completing an invitation in a browser already signed into another account
-  // must still lead to a fresh login, rather than silently reopening that portal.
-  await (await serverClient()).auth.signOut({ scope: 'local' });
-  return { redirect: '/credentials-updated?mode=activation' };
+  throw new ActivationFailure('invalid');
 }
 export async function forgotPassword(body: Record<string, unknown>) {
   const email = input(body, 'email').trim().toLowerCase();
@@ -172,12 +182,17 @@ export async function updateCredentials(body: Record<string, unknown>) {
   if (!account) throw new AuthHttpError(401, 'Please sign in again.');
   const username = normalizeUsername(input(body, 'username', 64));
   if (!validUsername(username)) throw new AuthHttpError(400, 'Use a valid username with 3–32 characters.');
-  const oldPassword = input(body, 'oldPassword', 128);
-  const password = input(body, 'password', 128);
+  // First login after activation: the temporary password was just verified by
+  // sign-in, so a new password is mandatory and the current one is not re-asked.
+  const firstLogin = account.mustChangeCredentials;
+  const oldPassword = firstLogin ? '' : input(body, 'oldPassword', 128);
+  const password = firstLogin ? passwordInput(body) : input(body, 'password', 128);
   if (password) passwordInput(body);
-  if (!oldPassword) throw new AuthHttpError(400, 'Enter your current password to update credentials.');
+  if (!firstLogin && !oldPassword) throw new AuthHttpError(400, 'Enter your current password to update credentials.');
   await rateLimit('credentials', account.user.id, 5);
-  if (!await passwordMatches(account.profile.email, oldPassword)) throw new AuthHttpError(401, 'The current password is incorrect.');
+  if (firstLogin) {
+    if (await passwordMatches(account.profile.email, password)) throw new AuthHttpError(400, 'Choose a new password, not the temporary one from your email.');
+  } else if (!await passwordMatches(account.profile.email, oldPassword)) throw new AuthHttpError(401, 'The current password is incorrect.');
   const admin = adminClient();
   const { data: collision, error: lookupError } = await admin.from('profiles').select('id').eq('username', username).neq('id', account.profile.id).maybeSingle();
   if (lookupError) throw new AuthHttpError(503, 'Credentials are temporarily unavailable.');
@@ -188,9 +203,13 @@ export async function updateCredentials(body: Record<string, unknown>) {
   }
   const { error } = await admin.from('profiles').update({ username }).eq('id', account.profile.id).eq('status', 'active');
   if (error) throw new AuthHttpError(409, password ? 'Password updated, but the username was unavailable. Sign in using your previous username and new password.' : 'This username is unavailable.');
+  if (firstLogin) {
+    const { error: flagError } = await admin.auth.admin.updateUserById(account.user.id, { app_metadata: { [MUST_CHANGE_CREDENTIALS]: false } });
+    if (flagError) throw new AuthHttpError(503, 'Credentials saved, but setup could not finish. Sign in with your new username and password, then retry.');
+  }
   const { error: signOutError } = await account.client.auth.signOut({ scope: 'global' });
   if (signOutError) throw new AuthHttpError(503, 'Credentials updated. Please sign out and sign in again.');
   jarClearRecovery(await cookies());
-  return { redirect: '/credentials-updated' };
+  return { redirect: firstLogin ? '/credentials-updated?mode=activation' : '/credentials-updated' };
 }
-function jarClearRecovery(jar: Awaited<ReturnType<typeof cookies>>) { for (const key of [ACTIVATION_COOKIE, RECOVERY_TOKEN_COOKIE, RECOVERY_PROOF_COOKIE]) jar.delete(key); }
+function jarClearRecovery(jar: Awaited<ReturnType<typeof cookies>>) { for (const key of [RECOVERY_TOKEN_COOKIE, RECOVERY_PROOF_COOKIE]) jar.delete(key); }

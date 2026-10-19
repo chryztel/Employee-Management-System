@@ -4,11 +4,11 @@ import { useRouter } from 'next/navigation';
 import { useState, type FormEvent } from 'react';
 import { Icon } from './ui';
 import { passwordRules, validPassword, validUsername, normalizeUsername } from '@/lib/auth/policy';
-type Mode = 'login' | 'activation-request' | 'activation-credentials' | 'credentials' | 'forgot' | 'reset';
+type Mode = 'login' | 'activation-request' | 'first-login' | 'credentials' | 'forgot' | 'reset';
 const copy: Record<Mode, { title: string; description: string; button: string; endpoint: string }> = {
   login: { title: 'Welcome back', description: 'Sign in to access your WorkSync workspace.', button: 'Log in', endpoint: 'login' },
-  'activation-request': { title: 'Activate your account', description: 'Enter the employee ID and email registered by your administrator.', button: 'Send activation link', endpoint: 'request-activation' },
-  'activation-credentials': { title: 'Create your credentials', description: 'Choose a username and strong password to complete account activation.', button: 'Activate account', endpoint: 'complete-activation' },
+  'activation-request': { title: 'Activate your account', description: 'Enter the employee ID and email registered by your administrator. We’ll email your temporary login.', button: 'Send login details', endpoint: 'request-activation' },
+  'first-login': { title: 'Create your credentials', description: 'Replace the temporary username and password from your email to finish activation.', button: 'Activate account', endpoint: 'credentials' },
   credentials: { title: 'Update user credentials', description: 'Confirm your current password to securely update your account.', button: 'Update credentials', endpoint: 'credentials' },
   forgot: { title: 'Forgot your password?', description: 'Enter your registered email. We’ll send instructions if the account is eligible.', button: 'Send recovery link', endpoint: 'forgot-password' },
   reset: { title: 'Reset your password', description: 'Create a new password to secure your workspace.', button: 'Reset password', endpoint: 'reset-password' },
@@ -22,10 +22,10 @@ export default function AuthForm({ mode, initialUsername = '', initialError = ''
   const [username, setUsername] = useState(initialUsername); const [email, setEmail] = useState(''); const [employeeId, setEmployeeId] = useState('');
   const [password, setPassword] = useState(''); const [oldPassword, setOldPassword] = useState(''); const [confirm, setConfirm] = useState('');
   const [error, setError] = useState(initialError); const [message, setMessage] = useState(notice); const [busy, setBusy] = useState(false);
-  const setup = ['activation-credentials', 'credentials', 'reset'].includes(mode); const rules = passwordRules(password);
+  const setup = ['first-login', 'credentials', 'reset'].includes(mode); const rules = passwordRules(password);
   async function submit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault(); setError(''); setMessage('');
-    if (['login', 'activation-credentials', 'credentials'].includes(mode) && !validUsername(normalizeUsername(username))) { setError('Use a username with 3–32 letters, numbers, dots, underscores, or hyphens.'); return; }
+    if (['login', 'first-login', 'credentials'].includes(mode) && !validUsername(normalizeUsername(username))) { setError('Use a username with 3–32 letters, numbers, dots, underscores, or hyphens.'); return; }
     if (setup && (mode !== 'credentials' || password)) {
       if (!validPassword(password)) { setError('Please meet all password requirements.'); return; }
       if (password !== confirm) { setError('The passwords do not match.'); return; }
@@ -35,7 +35,7 @@ export default function AuthForm({ mode, initialUsername = '', initialError = ''
       const response = await fetch(`/api/auth/${copy[mode].endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, email, employeeId, password, oldPassword, confirmPassword: confirm }) });
       const result = await response.json();
       if (!response.ok) { setError(result.error || 'We couldn’t complete this request. Please retry.'); return; }
-      const allowed = ['/employee', '/manager', '/credentials-updated', '/credentials-updated?mode=activation', '/credentials-updated?mode=recovery'];
+      const allowed = ['/employee', '/manager', '/update-credentials', '/credentials-updated', '/credentials-updated?mode=activation', '/credentials-updated?mode=recovery'];
       if (allowed.includes(result.redirect)) { router.replace(result.redirect); router.refresh(); return; }
       setMessage(result.message || 'Request completed.');
     } catch { setError('We couldn’t reach WorkSync. Check your connection and retry.'); }
@@ -45,7 +45,7 @@ export default function AuthForm({ mode, initialUsername = '', initialError = ''
     <form onSubmit={submit} className="auth-form" aria-busy={busy}>
       {['activation-request', 'forgot'].includes(mode) && <label className="auth-field"><span>{mode === 'activation-request' ? 'Registered email' : 'Email address'}</span><span className="auth-input"><Icon name="file" size={18}/><input type="email" value={email} onChange={e => setEmail(e.target.value)} required maxLength={254} autoComplete="email" placeholder="you@company.com"/></span></label>}
       {mode === 'activation-request' && <label className="auth-field"><span>Employee ID</span><span className="auth-input"><Icon name="user" size={18}/><input value={employeeId} onChange={e => setEmployeeId(e.target.value.toUpperCase())} maxLength={32} required placeholder="e.g. EMP-001" autoComplete="off"/></span></label>}
-      {['login', 'activation-credentials', 'credentials'].includes(mode) && <label className="auth-field"><span>Username</span><span className="auth-input"><Icon name="user" size={18}/><input value={username} onChange={e => setUsername(e.target.value)} maxLength={32} required autoComplete="username" placeholder="Enter your username"/></span>{mode !== 'login' && <small>3–32 characters: letters, numbers, dots, underscores, or hyphens.</small>}</label>}
+      {['login', 'first-login', 'credentials'].includes(mode) && <label className="auth-field"><span>Username</span><span className="auth-input"><Icon name="user" size={18}/><input value={username} onChange={e => setUsername(e.target.value)} maxLength={32} required autoComplete="username" placeholder="Enter your username"/></span>{mode !== 'login' && <small>3–32 characters: letters, numbers, dots, underscores, or hyphens.</small>}</label>}
       {mode === 'credentials' && <PasswordInput label="Current password" value={oldPassword} onChange={setOldPassword} autoComplete="current-password"/>}
       {mode !== 'activation-request' && mode !== 'forgot' && <PasswordInput label={mode === 'login' ? 'Password' : mode === 'credentials' ? 'New password (optional)' : 'New password'} value={password} onChange={setPassword} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} required={mode !== 'credentials'}/>}
       {setup && <PasswordInput label="Confirm new password" value={confirm} onChange={setConfirm} autoComplete="new-password" required={mode !== 'credentials' || !!password}/>}
